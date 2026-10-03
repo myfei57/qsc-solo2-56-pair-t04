@@ -25,5 +25,6 @@ packages = [
     "psdline.gap",
     "psdline.quota",
     "psdline.audit",
+    "psdline.condensation",
     "psdline.console",
 ]

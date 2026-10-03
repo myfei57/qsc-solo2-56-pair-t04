@@ -47,6 +47,34 @@
   "audit": {
     "journal_segment": 512
   },
+  "condensation": {
+    "sample_period_s": 5.0,
+    "window_s": 600.0,
+    "chain_segment": 1024,
+    "verify_on_start": true,
+    "rainy": {
+      "version": "rainy-v1",
+      "high_margin_c": 0.5,
+      "release_margin_c": -2.0,
+      "watch_margin_c": -1.0,
+      "high_dwell_s": 30.0,
+      "release_dwell_s": 120.0,
+      "trend_window_s": 120.0,
+      "trend_rate_c_per_min": 0.8,
+      "fast_dwell_ratio": 0.5
+    },
+    "normal": {
+      "version": "normal-v1",
+      "high_margin_c": 0.5,
+      "release_margin_c": -2.0,
+      "watch_margin_c": -1.0,
+      "high_dwell_s": 60.0,
+      "release_dwell_s": 180.0,
+      "trend_window_s": 300.0,
+      "trend_rate_c_per_min": 0.5,
+      "fast_dwell_ratio": 0.5
+    }
+  },
   "console": {
     "host": "127.0.0.1",
     "port": 8080

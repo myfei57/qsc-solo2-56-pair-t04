@@ -70,6 +70,16 @@ class Api:
         add("GET", "/api/audit", self._audit)
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/trend", self._trend)
+        add("GET", "/api/condensation", self._condensation)
+        add("GET", "/api/condensation/doors/{psdID}", self._condensation_door)
+        add("GET", "/api/condensation/replay", self._condensation_replay)
+        add("POST", "/api/condensation/poll", self._condensation_poll)
+        add("POST", "/api/condensation/attach", self._condensation_attach)
+        add("POST", "/api/condensation/bind", self._condensation_bind)
+        add("GET", "/api/condensation/snapshot", self._condensation_snapshot)
+        add("POST", "/api/condensation/wiped", self._condensation_wiped)
+        add("POST", "/api/condensation/force-release", self._condensation_force)
+        add("POST", "/api/condensation/inject-fault", self._condensation_inject_fault)
         add("GET", "/api/store", self._store)
         add("GET", "/api/mapping/{stationID}", self._mapping)
         add("GET", "/api/resolve", self._resolve)
@@ -184,6 +194,85 @@ class Api:
             "audit_log": self._platform.audit.journal.count() >= 0,
         }
         return {"ready": all(checks.values()), "checks": checks}
+
+    # ---- 凝露风险链 ---------------------------------------------------
+
+    def _condensation(self, params: dict, body: dict) -> dict:
+        return self._platform.env_status()
+
+    def _condensation_snapshot(self, params: dict, body: dict) -> dict:
+        return {"doors": self._platform.env.env_snapshot()}
+
+    def _condensation_door(self, params: dict, body: dict) -> dict:
+        return self._platform.env_door_view(str(params.get("psdID", "")))
+
+    def _condensation_replay(self, params: dict, body: dict) -> dict:
+        seq_raw = params.get("seq")
+        seq = int(seq_raw) if seq_raw not in (None, "") else None
+        return self._platform.env_replay(str(params.get("psd_id", "")), seq)
+
+    def _condensation_poll(self, params: dict, body: dict) -> dict:
+        if not self._platform.env.adapter_is_active():
+            raise RailError("凝露采集适配器未挂载", component="console")
+        return self._platform.env_poll()
+
+    def _condensation_attach(self, params: dict, body: dict) -> dict:
+        """挂载采集适配器。
+
+        生产部署由进程启动时注入现场适配器；接口保留 ``mode=scripted`` 供
+        联调与巡检使用，请求体给固定的空气温湿度与表面温度，全部门统一套用。
+        """
+
+        mode = str(body.get("mode", "scripted"))
+        if mode != "scripted":
+            raise RailError("接口只支持联调用 scripted 适配器，生产适配器请启动时注入",
+                            component="console")
+        from ..condensation import ScriptedAdapter, dew_point_c
+
+        air_t = _as_float(body, "air_t", 25.0)
+        rh = _as_float(body, "rh", 70.0)
+        surface = _as_float(body, "surface_t", dew_point_c(air_t, rh) + 5.0)
+        script = {}
+        for gate in self._platform.gates.list():
+            station = gate.station
+            script.setdefault(f"{station}-air", ("air_t", lambda ts, v=air_t: v))
+            script.setdefault(f"{station}-rh", ("rh", lambda ts, v=rh: v))
+            script[f"{gate.id}-surface"] = ("surface", lambda ts, v=surface: v)
+        return self._platform.auto_bind_env(ScriptedAdapter(script))
+
+    def _condensation_bind(self, params: dict, body: dict) -> dict:
+        surface = body.get("surface")
+        if isinstance(surface, str):
+            surface = [surface]
+        if not isinstance(surface, list) or not surface:
+            raise RailError("surface 必须是传感器标识或非空数组", component="console")
+        return self._platform.bind_env_sensors(
+            _require(body, "psd_id"),
+            _require(body, "air_t"),
+            _require(body, "rh"),
+            [str(item) for item in surface],
+        )
+
+    def _condensation_wiped(self, params: dict, body: dict) -> dict:
+        return self._platform.report_wiped(
+            _require(body, "psd_id"),
+            str(body.get("assignee", "现场班组")),
+            str(body.get("note", "")),
+        )
+
+    def _condensation_force(self, params: dict, body: dict) -> dict:
+        return self._platform.force_release_env(
+            _require(body, "psd_id"),
+            _require(body, "operator"),
+            _require(body, "reason"),
+        )
+
+    def _condensation_inject_fault(self, params: dict, body: dict) -> dict:
+        return self._platform.env_inject_fault(
+            _require(body, "sensor_id"),
+            bool(body.get("broken", True)),
+            str(body.get("error", "联调注入断线")),
+        )
 
     # ---- 动作 ---------------------------------------------------------
 

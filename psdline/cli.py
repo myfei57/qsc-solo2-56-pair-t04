@@ -6,6 +6,8 @@
 ``demo``    在本地跑一遍完整流程（到站开门 → 间隙探测 → 发车 → 批量开门 →
             门区联动 → 故障置位与解除 → 序号回绕 → 控制周期 → 清扫），用于交付
             前的真实运行检查；
+``env-demo`` 跑一遍门区凝露风险链（起雾摘除 → 擦拭 → 恢复放开 → 断线
+            fail-safe → 哈希链重放）；
 ``status``  打印当前状态快照；
 ``config``  打印生效配置；
 ``reset``   清掉落盘的平台计数。
@@ -182,6 +184,109 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_env_demo(args: argparse.Namespace) -> int:
+    """凝露风险链演示：起雾摘除 → 擦拭 → 恢复放开 → 断线 fail-safe → 重放。"""
+
+    import tempfile
+
+    from .condensation import ScriptedAdapter, dew_point_c
+
+    clock = ManualClock()
+    storage_root = getattr(args, "storage_root", None) or tempfile.mkdtemp(prefix="psdline-env-")
+    config = load_config(args.config) if getattr(args, "config", None) else default_config()
+    platform = build_platform(config, clock=clock, storage_root=storage_root)
+    platform.start()
+    station = args.station
+    gates = [gate.id for gate in platform.gates.by_station(station)]
+    target = gates[0]
+    air, rh = 28.0, 90.0
+    tdp = dew_point_c(air, rh)
+    mode = {"fog": False, "broken": ""}
+
+    def surface_factory(psd_id: str):
+        def surface(_ts: float):
+            if mode["broken"] == psd_id:
+                return None
+            if psd_id == target:
+                return tdp - 1.0 if mode["fog"] else tdp + 8.0
+            return tdp + 8.0
+        return surface
+
+    script = {
+        f"{station}-air": ("air_t", lambda _ts: air),
+        f"{station}-rh": ("rh", lambda _ts: rh),
+    }
+    for psd_id in gates:
+        script[f"{psd_id}-surface"] = ("surface", surface_factory(psd_id))
+    adapter = ScriptedAdapter(script)
+
+    class _DemoDispatcher:
+        """把派单结果收集进内存的演示派单通道。"""
+
+        def __init__(self) -> None:
+            self.sent: list[str] = []
+
+        def dispatch(self, order) -> None:
+            self.sent.append(order.id)
+
+    dispatcher = _DemoDispatcher()
+    platform.set_cleaning_dispatcher(dispatcher)
+    platform.auto_bind_env(adapter)
+
+    # 安全基线
+    for _ in range(3):
+        clock.advance(5)
+        platform.env_poll()
+    # 起雾
+    mode["fog"] = True
+    hold_seq = None
+    for _ in range(12):
+        clock.advance(5)
+        poll = platform.env_poll()
+        if platform.env.holds.is_held(target) and hold_seq is None:
+            hold_seq = poll["tick"]
+    wiped = platform.report_wiped(target, assignee="王师傅", note="玻璃已擦")
+    batch = platform.batch_open(station)
+    # 雾散恢复
+    mode["fog"] = False
+    released_tick = None
+    for _ in range(40):
+        clock.advance(5)
+        poll = platform.env_poll()
+        if not platform.env.holds.is_held(target):
+            released_tick = poll["tick"]
+            break
+    # 另一樘门断线
+    mode["broken"] = gates[1]
+    for _ in range(3):
+        clock.advance(5)
+        platform.env_poll()
+
+    replay = platform.env_replay()
+    report = {
+        "storage_root": storage_root,
+        "doors_bound": gates,
+        "hold_at_tick": hold_seq,
+        "wiped_held_immediately": wiped["held"],
+        "batch_held_gates": batch["held_gates"],
+        "released_at_tick": released_tick,
+        "sensor_fault_hold": platform.env.holds.get(gates[1]).as_dict()
+        if platform.env.holds.get(gates[1]) else None,
+        "replay": {
+            "chain_ok": replay["chain_ok"],
+            "entries": replay["entries"],
+            "facts": replay["fact_count"],
+            "fact_mismatches": replay["fact_mismatches"],
+        },
+        "status": platform.env_status(),
+    }
+    _dump(report)
+    if not replay["chain_ok"] or replay["fact_mismatches"] or hold_seq is None:
+        print("凝露链演示自检失败", file=sys.stderr)
+        return 1
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -207,6 +312,10 @@ def build_parser() -> argparse.ArgumentParser:
     demo.add_argument("--dt", type=float, default=1.0, help="控制周期步长（秒）")
     demo.add_argument("--fast", action="store_true", help="使用可推进时钟，跳过真实等待")
     demo.set_defaults(func=_cmd_demo)
+
+    env_demo = sub.add_parser("env-demo", help="跑一遍凝露风险链演示", parents=[common])
+    env_demo.add_argument("--station", default="ST1", help="演示用的站台标识")
+    env_demo.set_defaults(func=_cmd_env_demo)
 
     status = sub.add_parser("status", help="打印状态快照", parents=[common])
     status.set_defaults(func=_cmd_status)

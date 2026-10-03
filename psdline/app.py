@@ -12,6 +12,8 @@ from __future__ import annotations
 
 from .audit import AuditLog, build_timeline
 from .clock import Clock, SystemClock
+from .condensation import EnvController
+from .condensation.replay import replay_chain
 from .config import PlatformConfig, default_config, with_storage_root
 from .door import (
     DoorController,
@@ -134,6 +136,14 @@ class Platform:
         )
         self.doors.set_batch_limit(self.config.door.batch_limit)
 
+        self.env = EnvController(
+            config=self.config.condensation,
+            clock=self.clock,
+            store=store,
+            audit=self.audit,
+        )
+        self._env_restored: dict | None = None
+
         self._cycles = 0
         self._operations = 0
         self._event_counts: dict[str, int] = {}
@@ -220,6 +230,11 @@ class Platform:
             self._operations = int(state.get("operations", 0))
             self._cycles = int(state.get("cycles", 0))
         restore_lockouts(self.faults, self.gates, self.lockouts, not self.gaps.blocked_ids())
+        if self.env.chain.count() and self.config.condensation.verify_on_start:
+            # 凝露链与现场当前态必须能对上；链被改过或判据重放不一致，拒绝启动。
+            self._env_restored = self.env.restore_from_chain()
+        else:
+            self._env_restored = None
 
     def _persist(self) -> None:
         """落盘平台计数，供重启后对照。"""
@@ -427,8 +442,23 @@ class Platform:
 
         report = open_doors(self.doors, train_id, self.clock.now())
         group = self._primary_group(station_id)
+        deferred_by_condensation: list[str] = []
         if group:
-            open_group(self.doors, self.mappings, station_id, group)
+            try:
+                open_group(self.doors, self.mappings, station_id, group, self.env.holds)
+            except RailError as error:
+                if error.component != "condensation":
+                    raise
+                # 整组联动开门撞上凝露摘除：跳过该组并落审计，到站编排不回滚，
+                # 被摘门的擦拭闭环在凝露链里单独走。
+                deferred_by_condensation.append(group)
+                self.audit.record(
+                    "condensation_open_deferred",
+                    train_id,
+                    station_id,
+                    group=group,
+                    reason=str(error.message),
+                )
         self.train_doors.confirm_open(train_id, self.clock.now())
         self.bus.publish(
             Event.of(
@@ -441,7 +471,8 @@ class Platform:
                 group=group,
             )
         )
-        return {**report, "group": group}
+        return {**report, "group": group,
+                "deferred_by_condensation": deferred_by_condensation}
 
     def depart(self, train_id: str, station_id: str) -> dict:
         """关门到发车：关门指令 → 间隙探测 → 关门落盘 → 发车信号。"""
@@ -537,7 +568,16 @@ class Platform:
 
         mapping = self.mappings.renumber(station_id, groups)
         first_key = sorted(groups)[0]
-        linked = open_group(self.doors, self.mappings, station_id, first_key)
+        try:
+            linked = open_group(self.doors, self.mappings, station_id, first_key, self.env.holds)
+        except RailError as error:
+            if error.component != "condensation":
+                raise
+            self.audit.record(
+                "condensation_open_deferred", "", station_id,
+                group=first_key, reason=str(error.message),
+            )
+            linked = {"group": "", "held": True, "reason": error.message}
         self.audit.record("mapping_renumber", "", station_id, revision=mapping.revision)
         return {
             "ok": True,
@@ -623,11 +663,11 @@ class Platform:
         return {"ok": verdict.advanced, "verdict": verdict.as_dict(), "violations": [] if verdict.advanced else [verdict.reason]}
 
     def batch_open(self, station_id: str) -> dict:
-        """按布局里程顺序批量开门。"""
+        """按布局里程顺序批量开门，凝露摘除的门逐樘剔除并留痕。"""
 
         layout = self.layouts.get(station_id)
         zones = list(layout.zones) if layout else []
-        outcome = batch_open(self.doors, station_id, zones)
+        outcome = batch_open(self.doors, station_id, zones, self.env.holds)
         nearest = nearest_zone(zones)
         self.audit.record(
             "batch_open",
@@ -635,6 +675,7 @@ class Platform:
             station_id,
             opened=len(outcome["opened"]),
             skipped=len(outcome["skipped"]),
+            condensation_held=len(outcome["held_gates"]),
         )
         return {
             "ok": not outcome["skipped"],
@@ -643,6 +684,8 @@ class Platform:
             "opened": outcome["opened"],
             "deferred": outcome["deferred"],
             "skipped": outcome["skipped"],
+            "held": outcome["held"],
+            "held_gates": outcome["held_gates"],
             "nearest": nearest.id if nearest else "",
             "violations": [],
         }
@@ -666,6 +709,136 @@ class Platform:
         )
         return {"ok": True, "route": route.__dict__, "violations": []}
 
+    # ---- 凝露风险链 ---------------------------------------------------
+
+    def attach_env_adapter(self, adapter) -> dict:
+        """挂上环境采集适配器（真实现场实现 EnvAdapter 协议）。"""
+
+        self.env.set_adapter(adapter)
+        return {"ok": True, "adapter": type(adapter).__name__,
+                "bound_doors": len(self.env.bound_ids())}
+
+    def set_cleaning_dispatcher(self, dispatcher) -> dict:
+        """配置外部清扫/检修派单通道（短信、班组终端、工单系统）。
+
+        没配置时工单走"现场人工"模式：建单即视为已通知，班组从控制台/工单
+        看板取单；配置后每个 OPEN 工单按周期重派，失败留单下周期再试。
+        """
+
+        self.env.wipes.set_dispatcher(dispatcher)
+        self.audit.record("condensation_dispatcher_set", "", "",
+                         dispatcher=type(dispatcher).__name__)
+        return {"ok": True, "dispatcher": type(dispatcher).__name__}
+
+    def bind_env_sensors(
+        self,
+        psd_id: str,
+        air_t_sensor: str,
+        rh_sensor: str,
+        surface_sensors: str | list[str],
+    ) -> dict:
+        """把一樘门绑到门区空气温湿度与门体表面传感器。"""
+
+        gate = self.gates.require(psd_id)
+        self.env.bind_door(
+            psd_id,
+            gate.station,
+            air_t=air_t_sensor,
+            rh=rh_sensor,
+            surface=surface_sensors,
+        )
+        self.audit.record(
+            "condensation_bind",
+            "",
+            gate.station,
+            psd_id=psd_id,
+            air_t=air_t_sensor,
+            rh=rh_sensor,
+            surface=",".join(
+                [surface_sensors] if isinstance(surface_sensors, str) else list(surface_sensors)
+            ),
+        )
+        return {"ok": True, "psd_id": psd_id, "station_id": gate.station,
+                "binding": self.env.bindings()[psd_id]}
+
+    def auto_bind_env(self, adapter) -> dict:
+        """按适配器提供的传感器命名约定自动绑定全部门（演示/交付检查用）。
+
+        约定：门区空气传感器按站台共享 ``<station>-air`` / ``<station>-rh``，
+        门体表面传感器每樘一只 ``<psd_id>-surface``。
+        """
+
+        attached = self.attach_env_adapter(adapter)
+        bound: list[str] = []
+        for gate in self.gates.list():
+            air_id = f"{gate.station}-air"
+            rh_id = f"{gate.station}-rh"
+            surface_id = f"{gate.id}-surface"
+            known = adapter.sensor_ids() if hasattr(adapter, "sensor_ids") else {}
+            if not known or {air_id, rh_id, surface_id} <= set(known):
+                self.env.bind_door(
+                    gate.id, gate.station,
+                    air_t=air_id, rh=rh_id, surface=surface_id,
+                )
+                bound.append(gate.id)
+        return {"ok": True, "adapter": type(adapter).__name__, "bound": bound}
+
+    def env_inject_fault(self, sensor_id: str, broken: bool, error: str = "联调注入断线") -> dict:
+        """联调/巡检：对已挂载的脚本适配器注入或撤销传感器断线。"""
+
+        adapter = getattr(self.env, "_adapter", None)
+        if adapter is None or not hasattr(adapter, "fail"):
+            raise RailError("当前适配器不支持故障注入（仅联调脚本适配器支持）",
+                            component="console")
+        if broken:
+            adapter.fail(sensor_id, error)
+        else:
+            adapter.recover(sensor_id)
+        self.audit.record("condensation_fault_inject", "", "", sensor_id=sensor_id,
+                          broken=broken)
+        return {"ok": True, "sensor_id": sensor_id, "broken": broken}
+
+    def env_poll(self) -> dict:
+        """手动推进一个凝露采集节拍（不等控制周期）。"""
+
+        return self.env.poll(self.clock.now())
+
+    def report_wiped(self, psd_id: str, assignee: str = "现场班组", note: str = "") -> dict:
+        """班组回报擦拭/检修完成；门是否放开由判据恢复确认决定。"""
+
+        return self.env.report_wiped(psd_id, self.clock.now(), assignee=assignee, note=note)
+
+    def force_release_env(self, psd_id: str, operator: str, reason: str) -> dict:
+        """值班员紧急放开凝露摘除（必须登记操作人与理由）。"""
+
+        return self.env.force_release(psd_id, operator, reason, self.clock.now())
+
+    def env_door_view(self, psd_id: str) -> dict:
+        """单门凝露视图：绑定、最新输入、判定事实、摘除与工单。"""
+
+        self.gates.require(psd_id)
+        view = self.env.door_view(psd_id)
+        view["station_id"] = self.env.station_of(psd_id) or view["station_id"]
+        return view
+
+    def env_status(self) -> dict:
+        """凝露链汇总：摘除、传感器健康、工单、哈希链尾。"""
+
+        return self.env.summary()
+
+    def env_replay(self, psd_id: str = "", seq: int | None = None) -> dict:
+        """重放凝露链：哈希校验 + 判据复算比对，可只看某条判定的依据。"""
+
+        from .condensation.replay import explain
+
+        result = replay_chain(self.env.chain, self.config.condensation, self.env.bindings())
+        payload = result.as_dict()
+        if seq is not None:
+            payload["explain"] = explain(self.env.chain, int(seq))
+        if psd_id:
+            payload["levels"] = [item for item in result.levels if item["psd_id"] == psd_id]
+        return payload
+
     # ---- 控制循环 -----------------------------------------------------
 
     def cycle(self, dt: float = 1.0) -> dict:
@@ -687,6 +860,12 @@ class Platform:
         self.trend.append("locked_count", moment, interlock["locked_count"])
         self.trend.append("queued_commands", moment, queued_total(self.doors))
         self.trend.append("audit_entries", moment, len(self.audit.list()))
+        env_poll = None
+        if self.env_adapter_active():
+            env_poll = self.env.poll(moment)
+            self.trend.append(
+                "condensation_held", moment, len(self.env.holds.held_ids())
+            )
         self._persist()
         return {
             "ok": True,
@@ -697,8 +876,18 @@ class Platform:
             "can_release_depart": interlock["can_release_depart"],
             "ready_trains": holding,
             "gaps": gap_summary(self.gaps, [train.id for train in self.trains.list()]),
+            "condensation": {
+                "polled": env_poll is not None,
+                "held": self.env.holds.held_ids(),
+                "transitions": env_poll["transitions"] if env_poll else [],
+            },
             "violations": [],
         }
+
+    def env_adapter_active(self) -> bool:
+        """凝露采集是否已接适配器且至少绑定了一樘门。"""
+
+        return self.env.adapter_is_active() and bool(self.env.bound_ids())
 
     # ---- 查询 ---------------------------------------------------------
 
@@ -748,6 +937,7 @@ class Platform:
             },
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
+            "condensation": self.env.summary(),
             "trend": self.trend.snapshot(limit=4),
             "ids_issued": self.ids.issued(),
         }

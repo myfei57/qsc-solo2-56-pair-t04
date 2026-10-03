@@ -13,6 +13,12 @@ from dataclasses import dataclass, field, replace
 
 from .errors import ConfigError
 
+from .condensation.config import (
+    CondensationConfig,
+    condensation_from_mapping,
+    condensation_to_mapping,
+)
+
 
 @dataclass(frozen=True)
 class PlatformSection:
@@ -125,6 +131,7 @@ class PlatformConfig:
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
+    condensation: CondensationConfig = field(default_factory=CondensationConfig)
 
     @property
     def name(self) -> str:
@@ -214,6 +221,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
         "console": dict(config.console.__dict__),
+        "condensation": condensation_to_mapping(config.condensation),
     }
 
 
@@ -234,6 +242,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
         console=_section(ConsoleSection, payload.get("console")),
+        condensation=condensation_from_mapping(payload.get("condensation")),
     )
     return config.validate()
 

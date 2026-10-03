@@ -20,8 +20,9 @@ def open_group(
     mapping: MappingRegistry,
     station_id: str,
     group_key: str,
+    holds: object | None = None,
 ) -> dict:
-    """按映射打开一个门区组。"""
+    """按映射打开一个门区组；``holds`` 非空时执行凝露摘除第二道防线。"""
 
     resolved = mapping.resolve(station_id, group_key)
     gate_ids = [gate.id for gate in controller.gates.by_station(station_id) if gate.group == resolved]
@@ -33,6 +34,11 @@ def open_group(
     locked = [gate_id for gate_id in gate_ids if controller.lockouts.is_locked(gate_id)]
     if locked:
         raise MappingError(f"门区 {resolved} 被联锁锁定: {','.join(locked)}", component="door")
+    if holds is not None:
+        held = [gate_id for gate_id in gate_ids if holds.is_held(gate_id)]
+        if held:
+            # 复用摘除登记表的统一拒绝出口，保证批量规划与联动执行同一套原因。
+            holds.assert_open_allowed(held[0])
     for gate_id in gate_ids:
         controller.gates.set_open(gate_id, True)
     controller.store.write(
