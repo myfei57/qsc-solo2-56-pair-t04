@@ -111,6 +111,24 @@ class ConsoleSection:
 
 
 @dataclass(frozen=True)
+class DewSection:
+    """凝露防护：启用开关、哈希链分段与雨季窗口（月/日）。"""
+
+    enabled: bool = True
+    chain_segment: int = 1024
+    rainy_start: tuple[int, int] = (6, 1)
+    rainy_end: tuple[int, int] = (9, 30)
+
+    def as_dict(self) -> dict:
+        return {
+            "enabled": self.enabled,
+            "chain_segment": self.chain_segment,
+            "rainy_start": list(self.rainy_start),
+            "rainy_end": list(self.rainy_end),
+        }
+
+
+@dataclass(frozen=True)
 class PlatformConfig:
     """一份完整的控制服务配置。"""
 
@@ -125,6 +143,7 @@ class PlatformConfig:
     quota: QuotaSection = field(default_factory=QuotaSection)
     audit: AuditSection = field(default_factory=AuditSection)
     console: ConsoleSection = field(default_factory=ConsoleSection)
+    dew: DewSection = field(default_factory=DewSection)
 
     @property
     def name(self) -> str:
@@ -171,6 +190,11 @@ class PlatformConfig:
             raise ConfigError("审计分段长度必须为正", component="config")
         if not 0 < self.console.port <= 65535:
             raise ConfigError("控制台端口必须落在 1..65535", component="config")
+        if self.dew.chain_segment <= 0:
+            raise ConfigError("凝露哈希链分段长度必须为正", component="dew")
+        for month in (self.dew.rainy_start[0], self.dew.rainy_end[0]):
+            if not 1 <= month <= 12:
+                raise ConfigError("雨季月份必须落在 1..12", component="dew")
         return self
 
 
@@ -214,6 +238,7 @@ def config_to_mapping(config: PlatformConfig) -> dict:
         "quota": dict(config.quota.__dict__),
         "audit": dict(config.audit.__dict__),
         "console": dict(config.console.__dict__),
+        "dew": config.dew.as_dict(),
     }
 
 
@@ -222,6 +247,15 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
 
     if not isinstance(payload, dict):
         raise ConfigError("配置必须是一个 JSON 对象", component="config")
+    dew_payload = payload.get("dew")
+    dew_kwargs: dict = {}
+    if isinstance(dew_payload, dict):
+        for key in ("rainy_start", "rainy_end"):
+            if key in dew_payload and isinstance(dew_payload[key], (list, tuple)):
+                dew_kwargs[key] = tuple(int(item) for item in dew_payload[key][:2])
+        for key in ("enabled", "chain_segment"):
+            if key in dew_payload:
+                dew_kwargs[key] = dew_payload[key]
     config = PlatformConfig(
         platform=_section(PlatformSection, payload.get("platform")),
         namespace=_section(NamespaceSection, payload.get("namespace")),
@@ -234,6 +268,7 @@ def config_from_mapping(payload: dict) -> PlatformConfig:
         quota=_section(QuotaSection, payload.get("quota")),
         audit=_section(AuditSection, payload.get("audit")),
         console=_section(ConsoleSection, payload.get("console")),
+        dew=DewSection(**dew_kwargs) if dew_kwargs else DewSection(),
     )
     return config.validate()
 

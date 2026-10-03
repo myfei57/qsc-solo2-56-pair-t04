@@ -47,6 +47,12 @@
   "audit": {
     "journal_segment": 512
   },
+  "dew": {
+    "enabled": true,
+    "chain_segment": 1024,
+    "rainy_start": [6, 1],
+    "rainy_end": [9, 30]
+  },
   "console": {
     "host": "127.0.0.1",
     "port": 8080

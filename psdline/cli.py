@@ -83,6 +83,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     sequence = platform.sequence_verdict(65534, 4)
     dwell = platform.register_dwell(args.train, 45.0, args.station)
     route = platform.assign_route(args.train, args.station, _next_station(platform, args.station), 1200)
+    dew_scenario = _dew_scenario(platform, args.station)
     departure = platform.depart(args.train, args.station)
     cycles = [platform.cycle(dt=args.dt) for _ in range(args.cycles)]
     final_sweep = platform.sweep(args.station)
@@ -110,6 +111,7 @@ def _cmd_demo(args: argparse.Namespace) -> int:
         "dwell": dwell,
         "route": route,
         "departure": departure,
+        "dew": dew_scenario,
         "cycles_run": len(cycles),
         "last_cycle": cycles[-1],
         "final_sweep": {key: final_sweep[key] for key in ("closed", "scanned")},
@@ -129,10 +131,47 @@ def _cmd_demo(args: argparse.Namespace) -> int:
     ):
         if not operation.get("ok"):
             failures.extend(f"{name}:{item}" for item in operation.get("violations", []))
+    if not dew_scenario.get("replay_ok"):
+        failures.append("dew:replay mismatch")
+    if dew_scenario.get("excluded_when_foggy") != "dew":
+        failures.append("dew:foggy door not excluded")
+    if not dew_scenario.get("reopened_after_wipe"):
+        failures.append("dew:door not reopened after wipe")
     if failures:
         print(f"检查未通过: {failures}", file=sys.stderr)
         return 1
     return 0
+
+
+def _dew_scenario(platform: Platform, station: str) -> dict:
+    """演示凝露链路：健康→起雾摘门→擦拭→恢复放开→重放校验。"""
+
+    group = "G01"
+    for _ in range(4):
+        platform.dew_sample(station, group, 28.0, 70.0, 27.0)
+        platform.clock.advance(60)
+    before = platform.batch_open(station)
+    platform.dew_sample(station, group, 29.0, 80.0, 28.6)
+    platform.clock.advance(60)
+    platform.dew_sample(station, group, 30.0, 90.0, 28.0)  # 玻璃破露点
+    held = platform.batch_open(station)
+    key = f"{station}-{group}"
+    wipes = [o for o in platform.dew.planner.list_orders(key) if o.kind == "WIPE"]
+    if wipes:
+        platform.dew_report_wipe(wipes[0].id)
+    platform.clock.advance(60)
+    for _ in range(10):
+        platform.clock.advance(60)
+        platform.dew_sample(station, group, 26.0, 55.0, 30.0)
+    released = platform.batch_open(station)
+    replay = platform.dew_replay()
+    return {
+        "opened_before_fog": group in before["opened"],
+        "excluded_when_foggy": held["skipped"].get(group),
+        "reopened_after_wipe": group in released["opened"],
+        "replay_ok": replay["ok"],
+        "replay_edges": replay["edges_rebuilt"],
+    }
 
 
 def _mirror_mapping(platform: Platform, station_id: str) -> dict[str, str]:
@@ -182,6 +221,18 @@ def _cmd_reset(args: argparse.Namespace) -> int:
     return 0
 
 
+def _cmd_dew(args: argparse.Namespace) -> int:
+    platform = _build(args)
+    if args.dew_action == "status":
+        _dump(platform.dew_status())
+        return 0
+    if args.dew_action == "replay":
+        _dump(platform.dew_replay())
+        return 0
+    _dump(platform.dew_explain(args.station, args.group))
+    return 0
+
+
 def build_parser() -> argparse.ArgumentParser:
     """构造命令行解析器。"""
 
@@ -216,6 +267,12 @@ def build_parser() -> argparse.ArgumentParser:
 
     reset = sub.add_parser("reset", help="清掉落盘的平台计数", parents=[common])
     reset.set_defaults(func=_cmd_reset)
+
+    dew = sub.add_parser("dew", help="凝露防护：状态 / 重放 / 解释", parents=[common])
+    dew.add_argument("dew_action", choices=("status", "replay", "explain"))
+    dew.add_argument("--station", default="ST1")
+    dew.add_argument("--group", default="G01")
+    dew.set_defaults(func=_cmd_dew)
     return parser
 
 

@@ -13,6 +13,16 @@ from __future__ import annotations
 from .audit import AuditLog, build_timeline
 from .clock import Clock, SystemClock
 from .config import PlatformConfig, default_config, with_storage_root
+from .dew import (
+    DewPolicySchedule,
+    DewSystem,
+    EventChain,
+    RainySeason,
+    Replayer,
+    ZoneTopology,
+)
+from .dew.sensors import Channel, DriverHolder
+from .dew.coordinator import null_dispatcher
 from .door import (
     DoorController,
     active_group,
@@ -134,12 +144,23 @@ class Platform:
         )
         self.doors.set_batch_limit(self.config.door.batch_limit)
 
+        self.dew: DewSystem | None = None
+        self._dew_readers: dict[str, object] = {}
+        if self.config.dew.enabled:
+            self._build_dew()
+
         self._cycles = 0
         self._operations = 0
         self._event_counts: dict[str, int] = {}
         self.bus.subscribe("*", self._on_event)
         self._register_namespaces()
         self._seed(store)
+        if self.dew is not None:
+            self._ensure_dew_holders()
+            # 先从哈希链恢复历史门区运行态，再登记新布局里新增的门区。
+            self._dew_restore = self.dew.restore_from_chain()
+            self._register_dew_zones()
+            self._reattach_restore_readers()
         self._restore()
 
     def _on_event(self, event: Event) -> None:
@@ -163,6 +184,87 @@ class Platform:
             ("station", "audit", "audit-sink"),
         ):
             self.namespaces.register(area, device, kind)
+
+    def _build_dew(self) -> None:
+        """装配凝露防护：哈希链落盘、雨季策略、每门区登记环境拓扑。"""
+
+        chain = EventChain(
+            JsonlJournal(
+                self.store.root,
+                "dew-chain",
+                segment_limit=self.config.dew.chain_segment,
+            )
+        )
+        season = RainySeason(
+            start_md=tuple(self.config.dew.rainy_start),
+            end_md=tuple(self.config.dew.rainy_end),
+        )
+        schedule = DewPolicySchedule(season=season)
+        self.dew = DewSystem(
+            chain,
+            schedule,
+            bus=self.bus,
+            dispatcher=null_dispatcher,
+            clock=self.clock.now,
+            readers=self._dew_readers,
+        )
+        self._register_dew_zones()
+
+    def _reattach_restore_readers(self) -> None:
+        """恢复后把每个已登记门区的通道重绑到当前驱动持有器。"""
+
+        assert self.dew is not None
+        for zone in self.dew.zones.values():
+            for kind, states in zone.monitor._states.items():
+                for state in states:
+                    holder = self._dew_readers.get(state.channel.name)
+                    if holder is not None:
+                        state.channel = Channel(
+                            name=state.channel.name, kind=kind, read=holder
+                        )
+
+    def _ensure_dew_holders(self) -> None:
+        """为哈希链上已有的历史通道补上驱动持有器（重启恢复用）。"""
+
+        assert self.dew is not None
+        for event in self.dew.chain.events("dew.topology"):
+            for name in event.payload.get("channels", []):
+                self._dew_readers.setdefault(name, DriverHolder())
+
+    def _register_dew_zones(self) -> None:
+        """每个物理门区（group）登记一套最小环境拓扑（三量单通道）。
+
+        每个通道挂一个可热替换的 :class:`DriverHolder`：登记时即使现场采集
+        还没接线，后续注入读数（或断线恢复换驱动）也不需要重建传感器与其
+        健康史。
+        """
+
+        assert self.dew is not None
+        existing = self.dew.chain_zone_ids()
+        for station_id in self.namespace.station_ids():
+            layout = self.layouts.get(station_id)
+            if layout is None:
+                continue
+            for zone in layout.zones:
+                zone_id = f"{station_id}-{zone.id}"
+                if zone_id in self.dew.zones or zone_id in existing:
+                    continue
+                channels: dict[str, tuple[str, ...]] = {
+                    kind: (f"{zone_id}:{kind}",)
+                    for kind in ("air_c", "rh_pct", "glass_c")
+                }
+                readers: dict[str, DriverHolder] = {}
+                for name in (entry for names in channels.values() for entry in names):
+                    holder = self._dew_readers.setdefault(name, DriverHolder())
+                    readers[name] = holder
+                self.dew.add_zone(
+                    ZoneTopology(
+                        zone_id=zone_id,
+                        station_id=station_id,
+                        channels=channels,
+                        readers=readers,
+                    )
+                )
 
     def _seed(self, store: JsonStore) -> None:
         """按线路命名空间布置站台、布局、映射与站台门。"""
@@ -623,11 +725,12 @@ class Platform:
         return {"ok": verdict.advanced, "verdict": verdict.as_dict(), "violations": [] if verdict.advanced else [verdict.reason]}
 
     def batch_open(self, station_id: str) -> dict:
-        """按布局里程顺序批量开门。"""
+        """按布局里程顺序批量开门（凝露占用的门区先摘出）。"""
 
         layout = self.layouts.get(station_id)
         zones = list(layout.zones) if layout else []
-        outcome = batch_open(self.doors, station_id, zones)
+        held = self._dew_held_groups(station_id)
+        outcome = batch_open(self.doors, station_id, zones, dew_held=held)
         nearest = nearest_zone(zones)
         self.audit.record(
             "batch_open",
@@ -635,6 +738,7 @@ class Platform:
             station_id,
             opened=len(outcome["opened"]),
             skipped=len(outcome["skipped"]),
+            dew_skipped=sorted(group for group, reason in outcome["skipped"].items() if reason == "dew"),
         )
         return {
             "ok": not outcome["skipped"],
@@ -643,6 +747,7 @@ class Platform:
             "opened": outcome["opened"],
             "deferred": outcome["deferred"],
             "skipped": outcome["skipped"],
+            "dew_excluded": sorted(group for group, reason in outcome["skipped"].items() if reason == "dew"),
             "nearest": nearest.id if nearest else "",
             "violations": [],
         }
@@ -651,6 +756,107 @@ class Platform:
         """整站清扫。"""
 
         return sweep_station(self.gates, station_id)
+
+    # ---- 凝露防护 -----------------------------------------------------
+
+    def require_dew(self) -> DewSystem:
+        """取凝露子系统，未启用时直接报错而不是静默跳过。"""
+
+        if self.dew is None:
+            raise RailError("凝露防护未启用（配置 dew.enabled=false）", component="dew")
+        return self.dew
+
+    def _dew_zone_id(self, station_id: str, group: str) -> str:
+        return f"{station_id}-{group}"
+
+    def _dew_held_groups(self, station_id: str) -> set[str]:
+        """返回该站台被凝露防护占用的门区（去掉站台前缀）。"""
+
+        if self.dew is None:
+            return set()
+        prefix = f"{station_id}-"
+        return {
+            zone_id[len(prefix):]
+            for zone_id in self.dew.holds.held_zones()
+            if zone_id.startswith(prefix)
+        }
+
+    def set_dew_reader(self, channel_name: str, reader: object) -> None:
+        """登记/热替换一个环境通道的读数驱动（生产接采集服务，测试接模拟源）。"""
+
+        holder = self._dew_readers.setdefault(channel_name, DriverHolder())
+        holder.set(reader)
+
+    def dew_sample(
+        self,
+        station_id: str,
+        group: str,
+        air_c: float | None,
+        rh_pct: float | None,
+        glass_c: float | None,
+    ) -> dict:
+        """注入一个门区一次环境采样（None 表示该路断线），随后推进一周期。"""
+
+        dew = self.require_dew()
+        zone_id = self._dew_zone_id(station_id, group)
+        if zone_id not in dew.zones:
+            raise RailError(f"凝露门区未登记: {zone_id}", component="dew")
+        for kind, value in (
+            ("air_c", air_c),
+            ("rh_pct", rh_pct),
+            ("glass_c", glass_c),
+        ):
+            dew_value = None if value is None else float(value)
+            self.set_dew_reader(f"{zone_id}:{kind}", lambda value=dew_value: value)
+        return self.dew_cycle()
+
+    def dew_cycle(self) -> dict:
+        """推进一个凝露采样/判定/联动周期（采集→判定→摘放门→清扫）。"""
+
+        return self.require_dew().tick()
+
+    def dew_report_wipe(self, order_id: str, note: str = "wiped") -> dict:
+        """清扫班组回报擦拭完成。"""
+
+        order = self.require_dew().report_order_done(order_id, note)
+        if order is None:
+            return {"ok": False, "order_id": order_id, "violations": ["工单不存在或已结束"]}
+        return {"ok": True, "order": order.as_dict(), "violations": []}
+
+    def dew_report_inspect(self, order_id: str, note: str = "sensor_restored") -> dict:
+        """检修回报环境采集恢复（核查工单完成）。"""
+
+        order = self.require_dew().report_order_done(order_id, note)
+        if order is None:
+            return {"ok": False, "order_id": order_id, "violations": ["工单不存在或已结束"]}
+        return {"ok": True, "order": order.as_dict(), "violations": []}
+
+    def dew_report_failed(self, order_id: str, note: str = "still_foggy") -> dict:
+        """班组回报在途工单失败（擦完仍起雾/探头没修好），擦拭失败自动开复擦单。"""
+
+        order = self.require_dew().report_order_failed(order_id, note)
+        if order is None:
+            return {"ok": False, "order_id": order_id, "violations": ["工单不存在或已结束"]}
+        return {"ok": True, "order": order.as_dict(), "violations": []}
+
+    def dew_replay(self) -> dict:
+        """校验哈希链并重放全部判定，返回完整性与一致性报告。"""
+
+        dew = self.require_dew()
+        return Replayer(dew.chain, dew.schedule).run()
+
+    def dew_explain(self, station_id: str, group: str, around_ts: float | None = None) -> dict:
+        """解释某门区当时为什么被摘门：证据、策略、摘放门与擦拭记录。"""
+
+        dew = self.require_dew()
+        return Replayer(dew.chain, dew.schedule).explain(
+            self._dew_zone_id(station_id, group), around_ts
+        )
+
+    def dew_status(self) -> dict:
+        """凝露子系统状态快照。"""
+
+        return self.require_dew().status()
 
     def register_dwell(self, train_id: str, seconds: float, station_id: str = "") -> dict:
         """登记停站时长。"""
@@ -748,6 +954,7 @@ class Platform:
             },
             "store": self.metrics.summary(),
             "audit": self.audit.summary(),
+            "dew": self.dew.status() if self.dew is not None else {"enabled": False},
             "trend": self.trend.snapshot(limit=4),
             "ids_issued": self.ids.issued(),
         }

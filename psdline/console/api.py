@@ -71,6 +71,13 @@ class Api:
         add("GET", "/api/timeline", self._timeline)
         add("GET", "/api/trend", self._trend)
         add("GET", "/api/store", self._store)
+        add("GET", "/api/dew", self._dew_status)
+        add("GET", "/api/dew/replay", self._dew_replay)
+        add("GET", "/api/dew/explain", self._dew_explain)
+        add("POST", "/api/dew/sample", self._dew_sample)
+        add("POST", "/api/dew/wipe-done", self._dew_wipe_done)
+        add("POST", "/api/dew/inspect-done", self._dew_inspect_done)
+        add("POST", "/api/dew/work-failed", self._dew_work_failed)
         add("GET", "/api/mapping/{stationID}", self._mapping)
         add("GET", "/api/resolve", self._resolve)
         add("GET", "/api/readiness", self._readiness)
@@ -264,3 +271,46 @@ class Api:
 
     def _reset_state(self, params: dict, body: dict) -> dict:
         return {"removed": self._platform.reset_state()}
+
+    # ---- 凝露防护 -----------------------------------------------------
+
+    def _dew_status(self, params: dict, body: dict) -> dict:
+        return self._platform.dew_status()
+
+    def _dew_replay(self, params: dict, body: dict) -> dict:
+        return self._platform.dew_replay()
+
+    def _dew_explain(self, params: dict, body: dict) -> dict:
+        station_id = str(params.get("station_id", body.get("station_id", "")))
+        group = str(params.get("group", body.get("group", "")))
+        around = params.get("around_ts", body.get("around_ts"))
+        around_ts = None if around in (None, "") else float(around)
+        return self._platform.dew_explain(station_id, group, around_ts)
+
+    def _dew_sample(self, params: dict, body: dict) -> dict:
+        def value(key: str):
+            raw = body.get(key)
+            return None if raw is None else float(raw)
+
+        return self._platform.dew_sample(
+            _require(body, "station_id"),
+            _require(body, "group"),
+            value("air_c"),
+            value("rh_pct"),
+            value("glass_c"),
+        )
+
+    def _dew_wipe_done(self, params: dict, body: dict) -> dict:
+        return self._platform.dew_report_wipe(
+            _require(body, "order_id"), str(body.get("note", "wiped"))
+        )
+
+    def _dew_inspect_done(self, params: dict, body: dict) -> dict:
+        return self._platform.dew_report_inspect(
+            _require(body, "order_id"), str(body.get("note", "sensor_restored"))
+        )
+
+    def _dew_work_failed(self, params: dict, body: dict) -> dict:
+        return self._platform.dew_report_failed(
+            _require(body, "order_id"), str(body.get("note", "still_foggy"))
+        )
